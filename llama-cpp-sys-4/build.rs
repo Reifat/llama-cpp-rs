@@ -128,7 +128,49 @@ fn macos_link_search_path() -> Option<String> {
     None
 }
 
+fn which_in_path(bin: &str) -> Option<String> {
+    let paths = env::var_os("PATH")?;
+    for p in std::env::split_paths(&paths) {
+        let cand = p.join(bin);
+        if cand.exists() && cand.is_file() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(md) = fs::metadata(&cand) {
+                    if md.permissions().mode() & 0o111 != 0 {
+                        return Some(cand.to_string_lossy().into_owned());
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                return Some(cand.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
+
+fn find_glslc_path() -> Option<String> {
+    // 1) ANDROID_NDK/shader-tools/*/*/glslc
+    if let Ok(ndk) = env::var("ANDROID_NDK") {
+        let pat = format!("{ndk}/shader-tools/*/glslc");
+        if let Ok(mut it) = glob(&pat) {
+            if let Some(Ok(p)) = it.next() {
+                return Some(p.to_string_lossy().into_owned());
+            }
+        }
+    }
+    // 2) PATH
+    which_in_path("glslc")
+}
+
 fn main() {
+    println!("cargo:rerun-if-env-changed=ANDROID_NDK");
+    println!("cargo:rerun-if-env-changed=VULKAN_SDK");
+    println!("cargo:rerun-if-env-changed=GGML_VULKAN_COOPMAT_GLSLC_SUPPORT");
+    println!("cargo:rerun-if-env-changed=GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT");
+
     let target = env::var("TARGET").unwrap();
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
@@ -153,6 +195,12 @@ fn main() {
     if !llama_dst.exists() {
         debug_log!("Copy {} to {}", llama_src.display(), llama_dst.display());
         copy_folder(&llama_src, &llama_dst);
+        // Убираем вложенный git-артефакт (в OUT_DIR он невалиден и ломает вызовы git)
+        let git_path = llama_dst.join(".git");
+        if git_path.exists() {
+            let _ = std::fs::remove_file(&git_path)
+                .or_else(|_| std::fs::remove_dir_all(&git_path));
+        }
     }
 
     unsafe {
@@ -283,6 +331,41 @@ fn main() {
 
     if cfg!(feature = "vulkan") {
         config.define("GGML_VULKAN", "ON");
+
+        // glslc: возьмём из NDK shader-tools или из PATH
+        if let Some(glslc) = find_glslc_path() {
+            config.define("Vulkan_GLSLC_EXECUTABLE", &glslc);
+            config.define("GGML_VULKAN_GLSLC", &glslc);
+            debug_log!("Using glslc at {}", glslc);
+        } else {
+            panic!("glslc not found (NDK shader-tools or PATH)");
+        }
+
+        // Заголовки Vulkan-Hpp (vulkan.hpp) из LunarG SDK
+        if let Ok(vsdk) = env::var("VULKAN_SDK") {
+            let inc = format!("{vsdk}/include");
+            config.define("Vulkan_INCLUDE_DIR", &inc);
+            debug_log!("Vulkan_INCLUDE_DIR = {}", inc);
+        }
+
+        // На Android принудительно укажем libvulkan из NDK, чтобы не схватить хостовую
+        if target.contains("android") {
+            let ndk = env::var("ANDROID_NDK").expect("ANDROID_NDK must be set for Android build");
+            let vklib = format!("{ndk}/toolchains/llvm/prebuilt/darwin-x86_64/\
+                                 sysroot/usr/lib/aarch64-linux-android/28/libvulkan.so");
+            config.define("Vulkan_LIBRARY", &vklib);
+            debug_log!("Vulkan_LIBRARY = {}", vklib);
+        }
+
+        // Опционально: отключить автодетект cooperative matrices через окружение
+        if let Ok(v) = env::var("GGML_VULKAN_COOPMAT_GLSLC_SUPPORT") {
+            config.define("GGML_VULKAN_COOPMAT_GLSLC_SUPPORT", v);
+        }
+        if let Ok(v) = env::var("GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT") {
+            config.define("GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT", v);
+        }
+
+        // Windows / Linux линковка по-прежнему хинтится ниже
         if cfg!(windows) {
             let vulkan_path = env::var("VULKAN_SDK")
                 .expect("Please install Vulkan SDK and ensure that VULKAN_SDK env variable is set");
@@ -290,7 +373,7 @@ fn main() {
             println!("cargo:rustc-link-search={}", vulkan_lib_path.display());
             println!("cargo:rustc-link-lib=vulkan-1");
         }
-        if cfg!(target_os = "linux") {
+        if cfg!(target_os = "linux") && !target.contains("android") {
             println!("cargo:rustc-link-lib=vulkan");
         }
     }
