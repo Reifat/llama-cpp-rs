@@ -53,17 +53,9 @@ fn extract_lib_names(out_dir: &Path, build_shared_libs: bool) -> Vec<String> {
     let lib_pattern = if cfg!(windows) {
         "*.lib"
     } else if cfg!(target_os = "macos") {
-        if build_shared_libs {
-            "*.dylib"
-        } else {
-            "*.a"
-        }
+        if build_shared_libs { "*.dylib" } else { "*.a" }
     } else {
-        if build_shared_libs {
-            "*.so"
-        } else {
-            "*.a"
-        }
+        if build_shared_libs { "*.so" } else { "*.a" }
     };
     let libs_dir = out_dir.join("lib*");
     let pattern = libs_dir.join(lib_pattern);
@@ -71,14 +63,11 @@ fn extract_lib_names(out_dir: &Path, build_shared_libs: bool) -> Vec<String> {
 
     let mut lib_names: Vec<String> = Vec::new();
 
-    // Process the libraries based on the pattern
     for entry in glob(pattern.to_str().unwrap()).unwrap() {
         match entry {
             Ok(path) => {
                 let stem = path.file_stem().unwrap();
                 let stem_str = stem.to_str().unwrap();
-
-                // Remove the "lib" prefix if present
                 let lib_name = if stem_str.starts_with("lib") {
                     stem_str.strip_prefix("lib").unwrap_or(stem_str)
                 } else {
@@ -109,9 +98,7 @@ fn extract_lib_assets(out_dir: &Path) -> Vec<PathBuf> {
 
     for entry in glob(pattern.to_str().unwrap()).unwrap() {
         match entry {
-            Ok(path) => {
-                files.push(path);
-            }
+            Ok(path) => files.push(path),
             Err(e) => eprintln!("cargo:warning=error={}", e),
         }
     }
@@ -125,9 +112,7 @@ fn macos_link_search_path() -> Option<String> {
         .output()
         .ok()?;
     if !output.status.success() {
-        println!(
-            "failed to run 'clang --print-search-dirs', continuing without a link search path"
-        );
+        println!("failed to run 'clang --print-search-dirs', continuing without a link search path");
         return None;
     }
 
@@ -151,15 +136,13 @@ fn main() {
     let llama_dst = out_dir.join("llama.cpp");
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("Failed to get CARGO_MANIFEST_DIR");
     let llama_src = Path::new(&manifest_dir).join("llama.cpp");
-    let build_shared_libs = cfg!(feature = "cuda") || cfg!(feature = "dynamic-link");
+    let build_shared_libs_env = false; /* std::env::var("LLAMA_BUILD_SHARED_LIBS")
+        .map(|v| v == "1")
+        .unwrap_or(false); */
+    let build_shared_libs = false; //build_shared_libs_env || cfg!(feature = "cuda") || cfg!(feature = "dynamic-link");
 
-    let build_shared_libs = std::env::var("LLAMA_BUILD_SHARED_LIBS")
-        .map(|v| v == "1")
-        .unwrap_or(build_shared_libs);
     let profile = env::var("LLAMA_LIB_PROFILE").unwrap_or("Release".to_string());
-    let static_crt = env::var("LLAMA_STATIC_CRT")
-        .map(|v| v == "1")
-        .unwrap_or(false);
+    let static_crt = env::var("LLAMA_STATIC_CRT").map(|v| v == "1").unwrap_or(false);
 
     debug_log!("TARGET: {}", target);
     debug_log!("CARGO_MANIFEST_DIR: {}", manifest_dir);
@@ -171,39 +154,58 @@ fn main() {
         debug_log!("Copy {} to {}", llama_src.display(), llama_dst.display());
         copy_folder(&llama_src, &llama_dst);
     }
-    // Speed up build
-    // TODO: Audit that the environment access only happens in single-threaded code.
+
     unsafe {
         env::set_var(
             "CMAKE_BUILD_PARALLEL_LEVEL",
-            std::thread::available_parallelism()
-                .unwrap()
-                .get()
-                .to_string(),
+            std::thread::available_parallelism().unwrap().get().to_string(),
         )
     };
 
-    // point to CC and CXX binaries on macOS
     if cfg!(all(feature = "mpi", target_os = "macos")) {
-        // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { env::set_var("CC", "/opt/homebrew/bin/mpicc") };
-        // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { env::set_var("CXX", "/opt/homebrew/bin/mpicxx") };
     }
+
+    // --- macOS: очистка протёкших NDK/инклудов и поиск SDK ---
+    if target.contains("apple") {
+        for k in [
+            "BINDGEN_EXTRA_CLANG_ARGS",
+            "BINDGEN_EXTRA_CLANG_ARGS_aarch64-apple-darwin",
+            "BINDGEN_EXTRA_CLANG_ARGS_aarch64_apple_darwin",
+            "CPATH","C_INCLUDE_PATH","CPLUS_INCLUDE_PATH","CPPFLAGS","CFLAGS",
+            "ANDROID_NDK","ANDROID_NDK_HOME","ANDROID_HOME",
+        ] {
+            std::env::remove_var(k);
+        }
+    }
+    let sdkroot = if target.contains("apple") {
+        let out = std::process::Command::new("xcrun")
+            .args(["--sdk","macosx","--show-sdk-path"])
+            .output()
+            .expect("xcrun not found; install Xcode Command Line Tools");
+        let s = String::from_utf8(out.stdout).unwrap();
+        Some(s.trim().to_string())
+    } else { None };
 
     // Bindings
     let mut builder = bindgen::Builder::default()
         .header("wrapper.h")
         .generate_comments(true)
-        // https://github.com/rust-lang/rust-bindgen/issues/1834
-        // "fatal error: 'string' file not found" on macOS
+        // macOS: иногда падает на <string> — просим C++
         .clang_arg("-xc++")
         .clang_arg("-std=c++11")
-        // .raw_line("#![feature(unsafe_extern_blocks)]") // https://github.com/rust-lang/rust/issues/123743
         .clang_arg(format!("-I{}", llama_dst.join("include").display()))
         .clang_arg(format!("-I{}", llama_dst.join("ggml/include").display()))
         .clang_arg(format!("-I{}", llama_dst.join("src").display()))
         .clang_arg(format!("-I{}", llama_dst.join("common").display()))
+        // направим bindgen в SDK macOS, чтобы не лез в NDK
+        .clang_args(
+            sdkroot
+                .as_ref()
+                .map(|p| vec!["-isysroot".into(), p.clone()])
+                .unwrap_or_default(),
+        )
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .derive_partialeq(true)
         .allowlist_function("ggml_.*")
@@ -213,78 +215,48 @@ fn main() {
         .allowlist_type("llama_.*")
         .allowlist_function("common_token_to_piece")
         .allowlist_function("common_tokenize")
-        // .allowlist_item("common_.*")
-        // .allowlist_function("common_tokenize")
-        // .allowlist_function("common_detokenize")
-        // .allowlist_type("common_.*")
-        // .allowlist_item("common_params")
-        // .allowlist_item("common_sampler_type")
-        // .allowlist_item("common_sampler_params")
         .allowlist_item("LLAMA_.*")
-        // .opaque_type("common_lora_adapter_info")
         .opaque_type("llama_grammar")
         .opaque_type("llama_grammar_parser")
         .opaque_type("llama_sampler_chain")
-        // .opaque_type("llama_context_deleter")
-        // .blocklist_type("llama_model_deleter")
         .opaque_type("std::.*");
-    
-    // Add RPC support if feature is enabled
+
     if cfg!(feature = "rpc") {
         builder = builder
             .clang_arg("-DRPC_SUPPORT")
             .allowlist_function("ggml_backend_rpc_.*")
             .allowlist_type("ggml_backend_rpc_.*");
     }
-    
+
     let bindings = builder
-        // .layout_tests(false)
-        // .derive_default(true)
-        // .enable_cxx_namespaces()
         .use_core()
         .prepend_enum_name(false)
         .generate()
         .expect("Failed to generate bindings");
 
-    // Write the generated bindings to an output file
     let bindings_path = out_dir.join("bindings.rs");
     bindings
-        .write_to_file(bindings_path.clone())
+        .write_to_file(&bindings_path)
         .expect("Failed to write bindings");
 
-    // temporary fix for https://github.com/rust-lang/rust/issues/123743 in
-    // cargo +nightly build
-    let contents = std::fs::read_to_string(bindings_path.clone()).unwrap();
+    // временный фикс: убираем unsafe в extern "C"
+    let contents = std::fs::read_to_string(&bindings_path).unwrap();
     let contents = contents.replace("unsafe extern \"C\" {", " extern \"C\" {");
-    fs::write(bindings_path, contents).unwrap();
+    fs::write(&bindings_path, contents).unwrap();
 
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-changed=./sherpa-onnx");
 
     debug_log!("Bindings Created");
 
-    // Build with Cmake
-
+    // Build with CMake
     let mut config = Config::new(&llama_dst);
 
-    // Would require extra source files to pointlessly
-    // be included in what's uploaded to and downloaded from
-    // crates.io, so deactivating these instead
     config.define("LLAMA_BUILD_TESTS", "OFF");
     config.define("LLAMA_BUILD_EXAMPLES", "OFF");
     config.define("LLAMA_BUILD_SERVER", "OFF");
+    config.define("BUILD_SHARED_LIBS", if build_shared_libs { "ON" } else { "OFF" });
 
-    config.define(
-        "BUILD_SHARED_LIBS",
-        if build_shared_libs { "ON" } else { "OFF" },
-    );
-
-    // use BLAS instead of OpenMP
-    // if cfg!(target_os = "macos") {
-    //     config.define("GGML_BLAS", "OFF");
-    // }
-
-    // see https://github.com/ggerganov/llama.cpp/blob/master/docs/build.md
     if cfg!(all(target_os = "windows", target_arch = "arm")) {
         config.define("GGML_OPENMP", "OFF");
     }
@@ -294,8 +266,6 @@ fn main() {
     }
 
     if target.contains("android") && target.contains("aarch64") {
-        // build flags for android taken from this doc
-        // https://github.com/ggerganov/llama.cpp/blob/master/docs/android.md
         let android_ndk = env::var("ANDROID_NDK")
             .expect("Please install Android NDK and ensure that ANDROID_NDK env variable is set");
         config.define(
@@ -320,7 +290,6 @@ fn main() {
             println!("cargo:rustc-link-search={}", vulkan_lib_path.display());
             println!("cargo:rustc-link-lib=vulkan-1");
         }
-
         if cfg!(target_os = "linux") {
             println!("cargo:rustc-link-lib=vulkan");
         }
@@ -344,20 +313,23 @@ fn main() {
         config.define("GGML_RPC", "ON");
     }
 
-    // General
+    // macOS: пробросим SDK и архитектуру
+    if let Some(sdk) = &sdkroot {
+        config.define("CMAKE_OSX_SYSROOT", sdk);
+        config.define("CMAKE_OSX_ARCHITECTURES", "arm64");
+    }
+
     config
         .profile(&profile)
-        .very_verbose(std::env::var("CMAKE_VERBOSE").is_ok()) // Not verbose by default
-        .always_configure(false);
+        .very_verbose(std::env::var("CMAKE_VERBOSE").is_ok())
+        // форсим полную реконфигурацию, чтобы не зависать на "Skipping configuration step"
+        .always_configure(true);
 
     let build_dir = config.build();
 
     // Search paths
     println!("cargo:rustc-link-search={}", out_dir.join("lib").display());
-    println!(
-        "cargo:rustc-link-search={}",
-        out_dir.join("lib64").display()
-    );
+    println!("cargo:rustc-link-search={}", out_dir.join("lib64").display());
     println!("cargo:rustc-link-search={}", build_dir.display());
 
     // Link libraries
@@ -366,14 +338,8 @@ fn main() {
     assert_ne!(llama_libs.len(), 0);
 
     for lib in llama_libs {
-        debug_log!(
-            "LINK {}",
-            format!("cargo:rustc-link-lib={}={}", llama_libs_kind, lib)
-        );
-        println!(
-            "{}",
-            format!("cargo:rustc-link-lib={}={}", llama_libs_kind, lib)
-        );
+        debug_log!("LINK {}", format!("cargo:rustc-link-lib={}={}", llama_libs_kind, lib));
+        println!("{}", format!("cargo:rustc-link-lib={}={}", llama_libs_kind, lib));
     }
 
     // OpenMP
@@ -388,25 +354,20 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=msvcrtd");
     }
 
-    // macOS
-    if cfg!(target_os = "macos") {
+    if target.contains("apple") {
         println!("cargo:rustc-link-lib=framework=Foundation");
         println!("cargo:rustc-link-lib=framework=Metal");
         println!("cargo:rustc-link-lib=framework=MetalKit");
         println!("cargo:rustc-link-lib=framework=Accelerate");
         println!("cargo:rustc-link-lib=c++");
-    }
-
-    // Linux
-    if cfg!(target_os = "linux") {
+    } else if target.contains("android") {
+        println!("cargo:rustc-link-lib=c++_static");
+        println!("cargo:rustc-link-lib=atomic");
+    } else if target.contains("linux") && !target.contains("android") {
         println!("cargo:rustc-link-lib=dylib=stdc++");
     }
 
     if target.contains("apple") {
-        // On (older) OSX we need to link against the clang runtime,
-        // which is hidden in some non-default path.
-        //
-        // More details at https://github.com/alexcrichton/curl-rust/issues/279.
         if let Some(path) = macos_link_search_path() {
             println!("cargo:rustc-link-lib=clang_rt.osx");
             println!("cargo:rustc-link-search={}", path);
@@ -417,16 +378,13 @@ fn main() {
     if build_shared_libs {
         let libs_assets = extract_lib_assets(&out_dir);
         for asset in libs_assets {
-            let asset_clone = asset.clone();
-            let filename = asset_clone.file_name().unwrap();
-            let filename = filename.to_str().unwrap();
+            let filename = asset.file_name().unwrap().to_str().unwrap();
             let dst = target_dir.join(filename);
             debug_log!("HARD LINK {} TO {}", asset.display(), dst.display());
             if !dst.exists() {
                 std::fs::hard_link(asset.clone(), dst).unwrap();
             }
 
-            // Copy DLLs to examples as well
             if target_dir.join("examples").exists() {
                 let dst = target_dir.join("examples").join(filename);
                 debug_log!("HARD LINK {} TO {}", asset.display(), dst.display());
@@ -435,7 +393,6 @@ fn main() {
                 }
             }
 
-            // Copy DLLs to target/profile/deps as well for tests
             let dst = target_dir.join("deps").join(filename);
             debug_log!("HARD LINK {} TO {}", asset.display(), dst.display());
             if !dst.exists() {
