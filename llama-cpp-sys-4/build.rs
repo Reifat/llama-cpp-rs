@@ -408,6 +408,12 @@ fn main() {
         // форсим полную реконфигурацию, чтобы не зависать на "Skipping configuration step"
         .always_configure(true);
 
+    if cfg!(feature = "curl") {
+        config.define("LLAMA_CURL", "ON");
+    } else {
+        config.define("LLAMA_CURL", "OFF");
+    }
+
     let build_dir = config.build();
 
     // Search paths
