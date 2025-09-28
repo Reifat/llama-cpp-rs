@@ -300,8 +300,9 @@ fn main() {
     // Build with CMake
     let mut config = Config::new(&llama_dst);
 
-    config.define("LLAMA_BUILD_TESTS", "OFF");
+    config.define("LLAMA_BUILD_TOOLS", "OFF");
     config.define("LLAMA_BUILD_EXAMPLES", "OFF");
+    config.define("LLAMA_BUILD_TESTS", "OFF");
     config.define("LLAMA_BUILD_SERVER", "OFF");
     config.define("BUILD_SHARED_LIBS", if build_shared_libs { "ON" } else { "OFF" });
 
@@ -321,7 +322,8 @@ fn main() {
             format!("{android_ndk}/build/cmake/android.toolchain.cmake"),
         );
         config.define("ANDROID_ABI", "arm64-v8a");
-        config.define("ANDROID_PLATFORM", "android-28");
+        let min_api = std::env::var("ANDROID_MIN_SDK").unwrap_or_else(|_| "33".into());
+        config.define("ANDROID_PLATFORM", format!("android-{}", min_api));
         config.define("CMAKE_SYSTEM_PROCESSOR", "arm64");
         config.define("CMAKE_C_FLAGS", "-march=armv8.7a");
         config.define("CMAKE_CXX_FLAGS", "-march=armv8.7a");
@@ -351,8 +353,9 @@ fn main() {
         // На Android принудительно укажем libvulkan из NDK, чтобы не схватить хостовую
         if target.contains("android") {
             let ndk = env::var("ANDROID_NDK").expect("ANDROID_NDK must be set for Android build");
-            let vklib = format!("{ndk}/toolchains/llvm/prebuilt/darwin-x86_64/\
-                                 sysroot/usr/lib/aarch64-linux-android/28/libvulkan.so");
+            let min_api = std::env::var("ANDROID_MIN_SDK").unwrap_or_else(|_| "33".into());
+            let vklib = format!("{ndk}/toolchains/llvm/prebuilt/darwin-x86_64/sysroot/usr/lib/aarch64-linux-android/{}/libvulkan.so", min_api);
+            config.define("Vulkan_LIBRARY", &vklib);
             config.define("Vulkan_LIBRARY", &vklib);
             debug_log!("Vulkan_LIBRARY = {}", vklib);
         }
@@ -407,6 +410,13 @@ fn main() {
         .very_verbose(std::env::var("CMAKE_VERBOSE").is_ok())
         // форсим полную реконфигурацию, чтобы не зависать на "Skipping configuration step"
         .always_configure(true);
+
+    if cfg!(feature = "curl") {
+        config.define("LLAMA_CURL", "ON");
+    } else {
+        config.define("LLAMA_CURL", "OFF");
+    }
+
 
     let build_dir = config.build();
 
