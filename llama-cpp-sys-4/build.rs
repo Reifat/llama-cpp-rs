@@ -350,14 +350,8 @@ fn main() {
             debug_log!("Vulkan_INCLUDE_DIR = {}", inc);
         }
 
-        // На Android принудительно укажем libvulkan из NDK, чтобы не схватить хостовую
         if target.contains("android") {
-            let ndk = env::var("ANDROID_NDK").expect("ANDROID_NDK must be set for Android build");
-            let min_api = std::env::var("ANDROID_MIN_SDK").unwrap_or_else(|_| "33".into());
-            let vklib = format!("{ndk}/toolchains/llvm/prebuilt/darwin-x86_64/sysroot/usr/lib/aarch64-linux-android/{}/libvulkan.so", min_api);
-            config.define("Vulkan_LIBRARY", &vklib);
-            config.define("Vulkan_LIBRARY", &vklib);
-            debug_log!("Vulkan_LIBRARY = {}", vklib);
+            println!("cargo:rustc-link-lib=vulkan");
         }
 
         // Опционально: отключить автодетект cooperative matrices через окружение
