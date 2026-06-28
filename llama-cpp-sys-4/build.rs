@@ -1,9 +1,10 @@
 use cmake::Config;
 use glob::glob;
+use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::{env, fs};
 
+// ===================== helpers =====================
 macro_rules! debug_log {
     ($($arg:tt)*) => {
         if std::env::var("BUILD_DEBUG").is_ok() {
@@ -12,479 +13,331 @@ macro_rules! debug_log {
     };
 }
 
-fn get_cargo_target_dir() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
-    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
-    let profile = std::env::var("PROFILE")?;
-    let mut target_dir = None;
-    let mut sub_path = out_dir.as_path();
-    while let Some(parent) = sub_path.parent() {
-        if parent.ends_with(&profile) {
-            target_dir = Some(parent);
-            break;
-        }
-        sub_path = parent;
-    }
-    let target_dir = target_dir.ok_or("not found")?;
-    Ok(target_dir.to_path_buf())
+fn target_flags() -> (bool, bool, bool, bool, bool, bool, String) {
+    let target = env::var("TARGET").expect("TARGET not set");
+    let is_android = target.contains("android");
+    let is_apple = target.contains("apple");
+    let is_ios = target.contains("apple-ios");
+    let is_macos = target.contains("apple-darwin");
+    let is_windows = target.contains("windows");
+    let is_linux = target.contains("linux") && !is_android;
+    (is_android, is_apple, is_ios, is_macos, is_windows, is_linux, target)
 }
 
-fn copy_folder(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).expect("Failed to create dst directory");
-    if cfg!(unix) {
-        std::process::Command::new("cp")
-            .arg("-rf")
-            .arg(src)
-            .arg(dst.parent().unwrap())
-            .status()
-            .expect("Failed to execute cp command");
-    }
-
-    if cfg!(windows) {
-        std::process::Command::new("robocopy.exe")
-            .arg("/e")
-            .arg(src)
-            .arg(dst)
-            .status()
-            .expect("Failed to execute robocopy command");
-    }
-}
-
-fn extract_lib_names(out_dir: &Path, build_shared_libs: bool) -> Vec<String> {
-    let lib_pattern = if cfg!(windows) {
-        "*.lib"
-    } else if cfg!(target_os = "macos") {
-        if build_shared_libs { "*.dylib" } else { "*.a" }
+fn apple_sdk_name_for_target(target: &str) -> &'static str {
+    if target.contains("apple-ios") {
+        if target.contains("sim") { "iphonesimulator" } else { "iphoneos" }
     } else {
-        if build_shared_libs { "*.so" } else { "*.a" }
-    };
-    let libs_dir = out_dir.join("lib*");
-    let pattern = libs_dir.join(lib_pattern);
-    debug_log!("Extract libs {}", pattern.display());
-
-    let mut lib_names: Vec<String> = Vec::new();
-
-    for entry in glob(pattern.to_str().unwrap()).unwrap() {
-        match entry {
-            Ok(path) => {
-                let stem = path.file_stem().unwrap();
-                let stem_str = stem.to_str().unwrap();
-                let lib_name = if stem_str.starts_with("lib") {
-                    stem_str.strip_prefix("lib").unwrap_or(stem_str)
-                } else {
-                    stem_str
-                };
-                lib_names.push(lib_name.to_string());
-            }
-            Err(e) => println!("cargo:warning=error={}", e),
-        }
+        "macosx"
     }
-    lib_names
 }
 
-fn extract_lib_assets(out_dir: &Path) -> Vec<PathBuf> {
-    let shared_lib_pattern = if cfg!(windows) {
-        "*.dll"
-    } else if cfg!(target_os = "macos") {
-        "*.dylib"
-    } else {
-        "*.so"
-    };
-
-    let shared_libs_dir = if cfg!(windows) { "bin" } else { "lib" };
-    let libs_dir = out_dir.join(shared_libs_dir);
-    let pattern = libs_dir.join(shared_lib_pattern);
-    debug_log!("Extract lib assets {}", pattern.display());
-    let mut files = Vec::new();
-
-    for entry in glob(pattern.to_str().unwrap()).unwrap() {
-        match entry {
-            Ok(path) => files.push(path),
-            Err(e) => eprintln!("cargo:warning=error={}", e),
-        }
-    }
-
-    files
-}
-
-fn macos_link_search_path() -> Option<String> {
-    let output = Command::new("clang")
-        .arg("--print-search-dirs")
+fn xcrun_sdk_path(sdk: &str) -> String {
+    let out = Command::new("xcrun")
+        .args(["--sdk", sdk, "--show-sdk-path"])
         .output()
-        .ok()?;
-    if !output.status.success() {
-        println!("failed to run 'clang --print-search-dirs', continuing without a link search path");
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        if line.contains("libraries: =") {
-            let path = line.split('=').nth(1)?;
-            return Some(format!("{}/lib/darwin", path));
-        }
-    }
-
-    println!("failed to determine link search path, continuing without it");
-    None
+        .expect("xcrun not found; install Xcode Command Line Tools");
+    assert!(out.status.success(), "xcrun failed to get SDK path for {sdk}");
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
-fn which_in_path(bin: &str) -> Option<String> {
-    let paths = env::var_os("PATH")?;
-    for p in std::env::split_paths(&paths) {
-        let cand = p.join(bin);
-        if cand.exists() && cand.is_file() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Ok(md) = fs::metadata(&cand) {
-                    if md.permissions().mode() & 0o111 != 0 {
-                        return Some(cand.to_string_lossy().into_owned());
-                    }
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                return Some(cand.to_string_lossy().into_owned());
-            }
+fn which_in_path(bin: &str) -> Option<PathBuf> {
+    let Some(paths) = env::var_os("PATH") else { return None; };
+    #[cfg(windows)]
+    let exts: Vec<String> = env::var("PATHEXT").unwrap_or(".EXE;.BAT;.CMD".into())
+        .split(';').map(|s| s.trim().trim_start_matches('.').to_ascii_lowercase()).map(|s| format!({{".{}"}}, s)).collect();
+    #[cfg(not(windows))]
+    let exts: Vec<String> = vec![String::new()];
+
+    for dir in env::split_paths(&paths) {
+        for ext in &exts {
+            let candidate = if ext.is_empty() { dir.join(bin) } else { dir.join(format!("{}{}", bin, ext)) };
+            if candidate.is_file() { return Some(candidate); }
         }
     }
     None
 }
 
-fn find_glslc_path() -> Option<String> {
-    // 1) ANDROID_NDK/shader-tools/*/*/glslc
+fn find_glslc_path() -> Option<PathBuf> {
+    // 1) ANDROID_NDK shader-tools (2-level glob because NDK layout varies)
     if let Ok(ndk) = env::var("ANDROID_NDK") {
-        let pat = format!("{ndk}/shader-tools/*/glslc");
-        if let Ok(mut it) = glob(&pat) {
-            if let Some(Ok(p)) = it.next() {
-                return Some(p.to_string_lossy().into_owned());
-            }
+        for pat in [
+            format!("{ndk}/shader-tools/*/*/glslc"),
+            format!("{ndk}/shader-tools/*/glslc"),
+            format!("{ndk}/toolchains/llvm/prebuilt/*/bin/glslc"),
+        ] {
+            if let Ok(mut it) = glob(&pat) { if let Some(Ok(p)) = it.next() { return Some(p); } }
         }
     }
-    // 2) PATH
+    // 2) VULKAN_SDK
+    if let Ok(vsdk) = env::var("VULKAN_SDK") {
+        for cand in ["glslc", "bin/glslc", "Bin/glslc", "Bin/glslc.exe"] {
+            let p = Path::new(&vsdk).join(cand);
+            if p.is_file() { return Some(p); }
+        }
+    }
+    // 3) PATH
     which_in_path("glslc")
 }
 
-fn main() {
-    println!("cargo:rerun-if-env-changed=ANDROID_NDK");
-    println!("cargo:rerun-if-env-changed=VULKAN_SDK");
-    println!("cargo:rerun-if-env-changed=GGML_VULKAN_COOPMAT_GLSLC_SUPPORT");
-    println!("cargo:rerun-if-env-changed=GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT");
+fn collect_lib_names(search_dirs: &[PathBuf], static_only: bool, is_windows: bool) -> Vec<String> {
+    use std::collections::BTreeSet;
 
-    let target = env::var("TARGET").unwrap();
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let mut out: BTreeSet<String> = BTreeSet::new();
 
-    let target_dir = get_cargo_target_dir().unwrap();
-    let llama_dst = out_dir.join("llama.cpp");
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("Failed to get CARGO_MANIFEST_DIR");
-    let llama_src = Path::new(&manifest_dir).join("llama.cpp");
-    let build_shared_libs_env = false; /* std::env::var("LLAMA_BUILD_SHARED_LIBS")
-        .map(|v| v == "1")
-        .unwrap_or(false); */
-    let build_shared_libs = false; //build_shared_libs_env || cfg!(feature = "cuda") || cfg!(feature = "dynamic-link");
-
-    let profile = env::var("LLAMA_LIB_PROFILE").unwrap_or("Release".to_string());
-    let static_crt = env::var("LLAMA_STATIC_CRT").map(|v| v == "1").unwrap_or(false);
-
-    debug_log!("TARGET: {}", target);
-    debug_log!("CARGO_MANIFEST_DIR: {}", manifest_dir);
-    debug_log!("TARGET_DIR: {}", target_dir.display());
-    debug_log!("OUT_DIR: {}", out_dir.display());
-    debug_log!("BUILD_SHARED: {}", build_shared_libs);
-
-    if !llama_dst.exists() {
-        debug_log!("Copy {} to {}", llama_src.display(), llama_dst.display());
-        copy_folder(&llama_src, &llama_dst);
-        // Убираем вложенный git-артефакт (в OUT_DIR он невалиден и ломает вызовы git)
-        let git_path = llama_dst.join(".git");
-        if git_path.exists() {
-            let _ = std::fs::remove_file(&git_path)
-                .or_else(|_| std::fs::remove_dir_all(&git_path));
-        }
-    }
-
-    unsafe {
-        env::set_var(
-            "CMAKE_BUILD_PARALLEL_LEVEL",
-            std::thread::available_parallelism().unwrap().get().to_string(),
-        )
+    // Паттерны по платформам:
+    // - Windows: линкуем по *.lib (и для статик, и для импорт-либов). *.dll не используем для -l.
+    // - Unix/Apple: статик — lib*.a; шары — lib*.so и/или lib*.dylib.
+    let static_patterns: &[&str] = if is_windows { &["*.lib"] } else { &["lib*.a"] };
+    let shared_patterns: &[&str] = if is_windows {
+        // импорт-либы на Windows всё равно *.lib; отдельный проход по *.dll не нужен.
+        &["*.lib"]
+    } else {
+        // ищем оба варианта, так корректно для Linux/macOS без знания таргета
+        &["lib*.so", "lib*.dylib"]
     };
 
-    if cfg!(all(feature = "mpi", target_os = "macos")) {
-        unsafe { env::set_var("CC", "/opt/homebrew/bin/mpicc") };
-        unsafe { env::set_var("CXX", "/opt/homebrew/bin/mpicxx") };
-    }
-
-    // --- macOS: очистка протёкших NDK/инклудов и поиск SDK ---
-    if target.contains("apple") {
-        for k in [
-            "BINDGEN_EXTRA_CLANG_ARGS",
-            "BINDGEN_EXTRA_CLANG_ARGS_aarch64-apple-darwin",
-            "BINDGEN_EXTRA_CLANG_ARGS_aarch64_apple_darwin",
-            "CPATH","C_INCLUDE_PATH","CPLUS_INCLUDE_PATH","CPPFLAGS","CFLAGS",
-            "ANDROID_NDK","ANDROID_NDK_HOME","ANDROID_HOME",
-        ] {
-            std::env::remove_var(k);
-        }
-    }
-    let sdkroot = if target.contains("apple") {
-        let out = std::process::Command::new("xcrun")
-            .args(["--sdk","macosx","--show-sdk-path"])
-            .output()
-            .expect("xcrun not found; install Xcode Command Line Tools");
-        let s = String::from_utf8(out.stdout).unwrap();
-        Some(s.trim().to_string())
-    } else { None };
-
-    // Bindings
-    let mut builder = bindgen::Builder::default()
-        .header("wrapper.h")
-        .generate_comments(true)
-        // macOS: иногда падает на <string> — просим C++
-        .clang_arg("-xc++")
-        .clang_arg("-std=c++11")
-        .clang_arg(format!("-I{}", llama_dst.join("include").display()))
-        .clang_arg(format!("-I{}", llama_dst.join("ggml/include").display()))
-        .clang_arg(format!("-I{}", llama_dst.join("src").display()))
-        .clang_arg(format!("-I{}", llama_dst.join("common").display()))
-        // направим bindgen в SDK macOS, чтобы не лез в NDK
-        .clang_args(
-            sdkroot
-                .as_ref()
-                .map(|p| vec!["-isysroot".into(), p.clone()])
-                .unwrap_or_default(),
-        )
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
-        .derive_partialeq(true)
-        .allowlist_function("ggml_.*")
-        .allowlist_type("ggml_.*")
-        .allowlist_function("llama_.*")
-        .allowlist_function("llama_lora_.*")
-        .allowlist_type("llama_.*")
-        .allowlist_function("common_token_to_piece")
-        .allowlist_function("common_tokenize")
-        .allowlist_item("LLAMA_.*")
-        .opaque_type("llama_grammar")
-        .opaque_type("llama_grammar_parser")
-        .opaque_type("llama_sampler_chain")
-        .opaque_type("std::.*");
-
-    if cfg!(feature = "rpc") {
-        builder = builder
-            .clang_arg("-DRPC_SUPPORT")
-            .allowlist_function("ggml_backend_rpc_.*")
-            .allowlist_type("ggml_backend_rpc_.*");
-    }
-
-    let bindings = builder
-        .use_core()
-        .prepend_enum_name(false)
-        .generate()
-        .expect("Failed to generate bindings");
-
-    let bindings_path = out_dir.join("bindings.rs");
-    bindings
-        .write_to_file(&bindings_path)
-        .expect("Failed to write bindings");
-
-    // временный фикс: убираем unsafe в extern "C"
-    let contents = std::fs::read_to_string(&bindings_path).unwrap();
-    let contents = contents.replace("unsafe extern \"C\" {", " extern \"C\" {");
-    fs::write(&bindings_path, contents).unwrap();
-
-    println!("cargo:rerun-if-changed=wrapper.h");
-    println!("cargo:rerun-if-changed=./sherpa-onnx");
-
-    debug_log!("Bindings Created");
-
-    // Build with CMake
-    let mut config = Config::new(&llama_dst);
-
-    config.define("LLAMA_BUILD_TOOLS", "OFF");
-    config.define("LLAMA_BUILD_EXAMPLES", "OFF");
-    config.define("LLAMA_BUILD_TESTS", "OFF");
-    config.define("LLAMA_BUILD_SERVER", "OFF");
-    config.define("BUILD_SHARED_LIBS", if build_shared_libs { "ON" } else { "OFF" });
-
-    if cfg!(all(target_os = "windows", target_arch = "arm")) {
-        config.define("GGML_OPENMP", "OFF");
-    }
-
-    if cfg!(windows) {
-        config.static_crt(static_crt);
-    }
-
-    if target.contains("android") && target.contains("aarch64") {
-        let android_ndk = env::var("ANDROID_NDK")
-            .expect("Please install Android NDK and ensure that ANDROID_NDK env variable is set");
-        config.define(
-            "CMAKE_TOOLCHAIN_FILE",
-            format!("{android_ndk}/build/cmake/android.toolchain.cmake"),
-        );
-        config.define("ANDROID_ABI", "arm64-v8a");
-        let min_api = std::env::var("ANDROID_MIN_SDK").unwrap_or_else(|_| "33".into());
-        config.define("ANDROID_PLATFORM", format!("android-{}", min_api));
-        config.define("CMAKE_SYSTEM_PROCESSOR", "arm64");
-        config.define("CMAKE_C_FLAGS", "-march=armv8.7a");
-        config.define("CMAKE_CXX_FLAGS", "-march=armv8.7a");
-        config.define("GGML_OPENMP", "OFF");
-        config.define("GGML_LLAMAFILE", "OFF");
-    }
-
-    if cfg!(feature = "vulkan") {
-        config.define("GGML_VULKAN", "ON");
-
-        // glslc: возьмём из NDK shader-tools или из PATH
-        if let Some(glslc) = find_glslc_path() {
-            config.define("Vulkan_GLSLC_EXECUTABLE", &glslc);
-            config.define("GGML_VULKAN_GLSLC", &glslc);
-            debug_log!("Using glslc at {}", glslc);
-        } else {
-            panic!("glslc not found (NDK shader-tools or PATH)");
-        }
-
-        // Заголовки Vulkan-Hpp (vulkan.hpp) из LunarG SDK
-        if let Ok(vsdk) = env::var("VULKAN_SDK") {
-            let inc = format!("{vsdk}/include");
-            config.define("Vulkan_INCLUDE_DIR", &inc);
-            debug_log!("Vulkan_INCLUDE_DIR = {}", inc);
-        }
-
-        if target.contains("android") {
-            println!("cargo:rustc-link-lib=vulkan");
-        }
-
-        // Опционально: отключить автодетект cooperative matrices через окружение
-        if let Ok(v) = env::var("GGML_VULKAN_COOPMAT_GLSLC_SUPPORT") {
-            config.define("GGML_VULKAN_COOPMAT_GLSLC_SUPPORT", v);
-        }
-        if let Ok(v) = env::var("GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT") {
-            config.define("GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT", v);
-        }
-
-        // Windows / Linux линковка по-прежнему хинтится ниже
-        if cfg!(windows) {
-            let vulkan_path = env::var("VULKAN_SDK")
-                .expect("Please install Vulkan SDK and ensure that VULKAN_SDK env variable is set");
-            let vulkan_lib_path = Path::new(&vulkan_path).join("Lib");
-            println!("cargo:rustc-link-search={}", vulkan_lib_path.display());
-            println!("cargo:rustc-link-lib=vulkan-1");
-        }
-        if cfg!(target_os = "linux") && !target.contains("android") {
-            println!("cargo:rustc-link-lib=vulkan");
-        }
-    }
-
-    if cfg!(feature = "cuda") {
-        config.define("GGML_CUDA", "ON");
-    }
-
-    if cfg!(feature = "openmp") {
-        config.define("GGML_OPENMP", "ON");
-    } else {
-        config.define("GGML_OPENMP", "OFF");
-    }
-
-    if cfg!(all(feature = "mpi")) {
-        config.define("LLAMA_MPI", "ON");
-    }
-
-    if cfg!(feature = "rpc") {
-        config.define("GGML_RPC", "ON");
-    }
-
-    // macOS: пробросим SDK и архитектуру
-    if let Some(sdk) = &sdkroot {
-        config.define("CMAKE_OSX_SYSROOT", sdk);
-        config.define("CMAKE_OSX_ARCHITECTURES", "arm64");
-    }
-
-    config
-        .profile(&profile)
-        .very_verbose(std::env::var("CMAKE_VERBOSE").is_ok())
-        // форсим полную реконфигурацию, чтобы не зависать на "Skipping configuration step"
-        .always_configure(true);
-
-    if cfg!(feature = "curl") {
-        config.define("LLAMA_CURL", "ON");
-    } else {
-        config.define("LLAMA_CURL", "OFF");
-    }
-
-
-    let build_dir = config.build();
-
-    // Search paths
-    println!("cargo:rustc-link-search={}", out_dir.join("lib").display());
-    println!("cargo:rustc-link-search={}", out_dir.join("lib64").display());
-    println!("cargo:rustc-link-search={}", build_dir.display());
-
-    // Link libraries
-    let llama_libs_kind = if build_shared_libs { "dylib" } else { "static" };
-    let llama_libs = extract_lib_names(&out_dir, build_shared_libs);
-    assert_ne!(llama_libs.len(), 0);
-
-    for lib in llama_libs {
-        debug_log!("LINK {}", format!("cargo:rustc-link-lib={}={}", llama_libs_kind, lib));
-        println!("{}", format!("cargo:rustc-link-lib={}={}", llama_libs_kind, lib));
-    }
-
-    // OpenMP
-    if cfg!(feature = "openmp") {
-        if target.contains("gnu") {
-            println!("cargo:rustc-link-lib=gomp");
-        }
-    }
-
-    // Windows debug
-    if cfg!(all(debug_assertions, windows)) {
-        println!("cargo:rustc-link-lib=dylib=msvcrtd");
-    }
-
-    if target.contains("apple") {
-        println!("cargo:rustc-link-lib=framework=Foundation");
-        println!("cargo:rustc-link-lib=framework=Metal");
-        println!("cargo:rustc-link-lib=framework=MetalKit");
-        println!("cargo:rustc-link-lib=framework=Accelerate");
-        println!("cargo:rustc-link-lib=c++");
-    } else if target.contains("android") {
-        println!("cargo:rustc-link-lib=c++_static");
-        println!("cargo:rustc-link-lib=atomic");
-    } else if target.contains("linux") && !target.contains("android") {
-        println!("cargo:rustc-link-lib=dylib=stdc++");
-    }
-
-    if target.contains("apple") {
-        if let Some(path) = macos_link_search_path() {
-            println!("cargo:rustc-link-lib=clang_rt.osx");
-            println!("cargo:rustc-link-search={}", path);
-        }
-    }
-
-    // copy DLLs to target
-    if build_shared_libs {
-        let libs_assets = extract_lib_assets(&out_dir);
-        for asset in libs_assets {
-            let filename = asset.file_name().unwrap().to_str().unwrap();
-            let dst = target_dir.join(filename);
-            debug_log!("HARD LINK {} TO {}", asset.display(), dst.display());
-            if !dst.exists() {
-                std::fs::hard_link(asset.clone(), dst).unwrap();
-            }
-
-            if target_dir.join("examples").exists() {
-                let dst = target_dir.join("examples").join(filename);
-                debug_log!("HARD LINK {} TO {}", asset.display(), dst.display());
-                if !dst.exists() {
-                    std::fs::hard_link(asset.clone(), dst).unwrap();
+    for dir in search_dirs {
+        // Статические библиотеки
+        for pat in static_patterns {
+            let pattern = dir.join(pat);
+            if let Some(s) = pattern.to_str() {
+                if let Ok(entries) = glob(s) {
+                    for entry in entries {
+                        if let Ok(path) = entry {
+                            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                                let name = if is_windows {
+                                    // foo.lib -> foo
+                                    stem.to_string()
+                                } else {
+                                    // libfoo.a -> foo
+                                    stem.trim_start_matches("lib").to_string()
+                                };
+                                out.insert(name);
+                            }
+                        }
+                    }
                 }
             }
+        }
 
-            let dst = target_dir.join("deps").join(filename);
-            debug_log!("HARD LINK {} TO {}", asset.display(), dst.display());
-            if !dst.exists() {
-                std::fs::hard_link(asset.clone(), dst).unwrap();
+        // Динамические (только если разрешено)
+        if !static_only {
+            for pat in shared_patterns {
+                let pattern = dir.join(pat);
+                if let Some(s) = pattern.to_str() {
+                    if let Ok(entries) = glob(s) {
+                        for entry in entries {
+                            if let Ok(path) = entry {
+                                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                                    let name = if is_windows {
+                                        // импорт-либы *.lib уже покрыты выше; dups отсеются BTreeSet'ом
+                                        stem.to_string()
+                                    } else {
+                                        stem.trim_start_matches("lib").to_string()
+                                    };
+                                    out.insert(name);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
+    }
+
+    // Отсортированный список (BTreeSet) -> Vec
+    out.into_iter().collect()
+}
+
+
+// ===================== main =====================
+fn main() {
+    // Re-run hints
+    println!("cargo:rerun-if-env-changed=ANDROID_NDK");
+    println!("cargo:rerun-if-env-changed=ANDROID_MIN_SDK");
+    println!("cargo:rerun-if-env-changed=VULKAN_SDK");
+    println!("cargo:rerun-if-env-changed=IOS_DEPLOYMENT_TARGET");
+    println!("cargo:rerun-if-env-changed=LLAMA_STATIC_CRT");
+    println!("cargo:rerun-if-env-changed=LLAMA_LIB_PROFILE");
+
+    let (is_android, is_apple, is_ios, is_macos, is_windows, is_linux, target) = target_flags();
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let src_dir = manifest_dir.join("llama.cpp"); // предполагается сабмодуль/вендор
+
+    let build_profile = env::var("LLAMA_LIB_PROFILE").unwrap_or_else(|_| "Release".to_string());
+    let static_crt = env::var("LLAMA_STATIC_CRT").map(|v| v == "1").unwrap_or(false);
+
+    let feature_vulkan = cfg!(feature = "vulkan");
+    let feature_metal  = cfg!(feature = "metal"); // для Apple
+    let build_shared_libs = false; // статически надёжнее
+
+    debug_log!("TARGET = {}", target);
+    debug_log!("OUT_DIR = {}", out_dir.display());
+    debug_log!("SRC = {}", src_dir.display());
+    debug_log!("PROFILE = {}", build_profile);
+    debug_log!("FEATURES: metal={} vulkan={}", feature_metal, feature_vulkan);
+
+    // -------- bindgen (заголовки) --------
+    // опционально — если проекту нужны биндинги из wrapper.h
+    if Path::new("wrapper.h").exists() {
+        // Apple SDK for clang/headers
+        let (sdk_name, sdk_path) = if is_apple {
+            let name = apple_sdk_name_for_target(&target);
+            (name.to_string(), xcrun_sdk_path(name))
+        } else { (String::new(), String::new()) };
+
+        let mut builder = bindgen::Builder::default()
+            .header("wrapper.h")
+            .generate_comments(true)
+            .clang_arg("-xc++")
+            .clang_arg("-std=c++11")
+            .clang_arg(format!("-I{}", src_dir.join("include").display()))
+            .clang_arg(format!("-I{}", src_dir.join("ggml/include").display()))
+            .clang_arg(format!("-I{}", src_dir.join("src").display()))
+            .clang_arg(format!("-I{}", src_dir.join("common").display()))
+            .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+            .derive_partialeq(true)
+            .allowlist_function("ggml_.*")
+            .allowlist_type("ggml_.*")
+            .allowlist_function("llama_.*")
+            .allowlist_type("llama_.*")
+            .allowlist_item("LLAMA_.*")
+            .opaque_type("llama_grammar")
+            .opaque_type("llama_grammar_parser")
+            .opaque_type("llama_sampler_chain")
+            .opaque_type("std::.*");
+
+        if !sdk_path.is_empty() {
+            builder = builder.clang_args(["-isysroot", &sdk_path]);
+        }
+
+        let bindings = builder.use_core().prepend_enum_name(false)
+            .generate().expect("bindgen failed");
+        let bindings_path = out_dir.join("bindings.rs");
+        bindings.write_to_file(&bindings_path).expect("write bindings");
+        println!("cargo:rerun-if-changed=wrapper.h");
+        debug_log!("Bindings generated at {}", bindings_path.display());
+    }
+
+    // -------- CMake configure/build --------
+    let mut cfg = Config::new(&src_dir);
+    cfg.profile(&build_profile)
+        .very_verbose(env::var("CMAKE_VERBOSE").is_ok())
+        .always_configure(true);
+
+    // core switches
+    cfg.define("BUILD_SHARED_LIBS", if build_shared_libs { "ON" } else { "OFF" });
+    cfg.define("LLAMA_BUILD_TESTS", "OFF");
+    cfg.define("LLAMA_BUILD_EXAMPLES", "OFF");
+    cfg.define("LLAMA_BUILD_TOOLS", "OFF");
+    cfg.define("LLAMA_BUILD_SERVER", "OFF");
+
+    // math backends common
+    if is_apple { cfg.define("GGML_USE_ACCELERATE", "ON"); } else { cfg.define("GGML_USE_ACCELERATE", "OFF"); }
+
+    // Metal (Apple): controlled by feature "metal"
+    if is_apple {
+        if feature_metal { cfg.define("GGML_METAL", "ON"); } else { cfg.define("GGML_METAL", "OFF"); }
+        cfg.define("GGML_BLAS", "OFF");
+
+        // Toolchain hints for Apple platforms
+        let sdk_name = apple_sdk_name_for_target(&target);
+        let sdk_path = xcrun_sdk_path(sdk_name);
+        cfg.define("CMAKE_OSX_SYSROOT", &sdk_path);
+
+        // architectures
+        if target.contains("x86_64") { cfg.define("CMAKE_OSX_ARCHITECTURES", "x86_64"); }
+        else { cfg.define("CMAKE_OSX_ARCHITECTURES", "arm64"); }
+
+        if is_ios {
+            cfg.define("CMAKE_SYSTEM_NAME", "iOS");
+            let ios_min = env::var("IOS_DEPLOYMENT_TARGET").unwrap_or_else(|_| "13.0".to_string());
+            cfg.define("CMAKE_OSX_DEPLOYMENT_TARGET", &ios_min);
+            // Не задаём вручную -isysroot в CFLAGS/CXXFLAGS — CMake сделает сам через CMAKE_OSX_SYSROOT
+            // PIC обязателен для iOS
+            cfg.define("CMAKE_POSITION_INDEPENDENT_CODE", "ON");
+        }
+    }
+
+    // Vulkan backend
+    if feature_vulkan {
+        cfg.define("GGML_VULKAN", "ON");
+        if let Some(glslc) = find_glslc_path() {
+            cfg.define("Vulkan_GLSLC_EXECUTABLE", glslc.to_str().unwrap());
+            cfg.define("GGML_VULKAN_GLSLC", glslc.to_str().unwrap());
+            debug_log!("Using glslc = {}", glslc.display());
+        } else {
+            panic!("glslc not found (NDK shader-tools, VULKAN_SDK, or PATH)");
+        }
+        if let Ok(vsdk) = env::var("VULKAN_SDK") { cfg.define("Vulkan_INCLUDE_DIR", format!("{vsdk}/include")); }
+        if is_android { println!("cargo:rustc-link-lib=vulkan"); }
+        if is_windows {
+            let vsdk = env::var("VULKAN_SDK").expect("VULKAN_SDK must be set on Windows for Vulkan");
+            println!("cargo:rustc-link-search={}", Path::new(&vsdk).join("Lib").display());
+            println!("cargo:rustc-link-lib=vulkan-1");
+        }
+        if is_linux { println!("cargo:rustc-link-lib=vulkan"); }
+    } else {
+        cfg.define("GGML_VULKAN", "OFF");
+    }
+
+    // Windows CRT
+    if is_windows && target.contains("msvc") {
+        cfg.static_crt(static_crt);
+    }
+
+    // Android toolchain
+    if is_android {
+        let ndk = env::var("ANDROID_NDK").expect("ANDROID_NDK must be set for Android builds");
+        cfg.define("CMAKE_TOOLCHAIN_FILE", format!("{ndk}/build/cmake/android.toolchain.cmake"));
+        cfg.define("ANDROID_ABI", if target.contains("aarch64") { "arm64-v8a" } else if target.contains("armv7") { "armeabi-v7a" } else if target.contains("i686") { "x86" } else { "x86_64" });
+        let min_api = env::var("ANDROID_MIN_SDK").unwrap_or_else(|_| "28".into());
+        cfg.define("ANDROID_PLATFORM", format!("android-{min_api}"));
+        cfg.define("CMAKE_SYSTEM_PROCESSOR", if target.contains("aarch64") { "arm64" } else { "arm" });
+        // Не форсим -march, даём NDK подобрать безопасно
+        cfg.define("GGML_OPENMP", "OFF");
+        cfg.define("GGML_LLAMAFILE", "OFF");
+    }
+
+    // Build
+    let build_dir = cfg.build();
+
+    // -------- Link search paths --------
+    for p in [
+        out_dir.join("lib"),
+        out_dir.join("lib64"),
+        build_dir.clone(),
+        build_dir.join("lib"),
+        build_dir.join("Release"),
+        build_dir.join("Debug"),
+    ] {
+        if p.is_dir() { println!("cargo:rustc-link-search={}", p.display()); }
+    }
+
+    // -------- Link libraries (static preferred) --------
+    let search_dirs = vec![
+        out_dir.join("lib"), out_dir.join("lib64"), build_dir.clone(), build_dir.join("lib"),
+        build_dir.join("Release"), build_dir.join("Debug")
+    ];
+    let libs = collect_lib_names(&search_dirs, true, is_windows);
+    assert!(!libs.is_empty(), "no static libraries produced by CMake: searched in {:?}", search_dirs);
+
+    for lib in libs { println!("cargo:rustc-link-lib=static={}", lib); }
+
+    // -------- Platform link hints --------
+    if is_apple {
+        println!("cargo:rustc-link-lib=framework=Foundation");
+        println!("cargo:rustc-link-lib=framework=Accelerate");
+        println!("cargo:rustc-link-lib=framework=Metal");
+        println!("cargo:rustc-link-lib=framework=MetalKit");
+        println!("cargo:rustc-link-lib=c++");
+    } else if is_android {
+        println!("cargo:rustc-link-lib=c++_static");
+        println!("cargo:rustc-link-lib=atomic");
+    } else if is_linux {
+        println!("cargo:rustc-link-lib=dylib=stdc++");
     }
 }
